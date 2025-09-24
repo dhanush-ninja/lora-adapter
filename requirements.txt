@@ -1,0 +1,5 @@
+paho-mqtt==1.6.1
+nats-py==2.7.0
+redis==5.0.1
+structlog==23.2.0
+pytest==7.4.3

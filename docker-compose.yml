@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  lora-redis:
+    image: redis:7-alpine
+    container_name: lora-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - lora-network
+
+  lora-adapter:
+    build: .
+    container_name: lora-adapter
+    restart: unless-stopped
+    depends_on:
+      - lora-redis
+    environment:
+      # ChirpStack MQTT Configuration
+      CHIRPSTACK_MQTT_HOST: ${CHIRPSTACK_MQTT_HOST}
+      CHIRPSTACK_MQTT_PORT: ${CHIRPSTACK_MQTT_PORT}
+      CHIRPSTACK_MQTT_USERNAME: ${CHIRPSTACK_MQTT_USERNAME:-}
+      CHIRPSTACK_MQTT_PASSWORD: ${CHIRPSTACK_MQTT_PASSWORD:-}
+      
+      # SuperMQ NATS Configuration
+      SUPERMQ_NATS_URL: ${SUPERMQ_NATS_URL}
+      SUPERMQ_NATS_USER: ${SUPERMQ_NATS_USER}
+      SUPERMQ_NATS_PASSWORD: ${SUPERMQ_NATS_PASSWORD}
+      
+      # Redis Configuration
+      REDIS_URL: ${REDIS_URL}
+      
+      # Logging Configuration
+      LOG_LEVEL: ${LOG_LEVEL}
+      
+      # Application Configuration
+      ADAPTER_NAME: ${ADAPTER_NAME}
+      HEALTH_CHECK_INTERVAL: ${HEALTH_CHECK_INTERVAL}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - lora-network
+
+volumes:
+  redis_data:
+
+networks:
+  lora-network:
+    driver: bridge
