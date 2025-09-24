@@ -14,10 +14,6 @@ A Python-based LoRa adapter that bridges ChirpStack MQTT messages to SuperMQ NAT
 
 ```
 ChirpStack MQTT ──→ LoRa Adapter ──→ SuperMQ NATS
-                         │
-                    Redis Route Map
-                         ↑
-                 SuperMQ Events (NATS)
 ```
 
 ## Configuration
