@@ -207,6 +207,14 @@ class ChirpStackMQTTSubscriber:
             # Extract actual sensor data from ChirpStack payload
             sensor_data = self.extract_sensor_data(payload)
             
+            metadata_fields = []
+            if "device_name" in sensor_data:
+                metadata_fields.append(f"deviceName='{sensor_data['device_name']}'")
+            if "tags" in sensor_data:
+                metadata_fields.append(f"tags={sensor_data['tags']}")
+            if metadata_fields:
+                logger.info(f"Including metadata: {', '.join(metadata_fields)}")
+            
             # Forward to SuperMQ via message forwarder
             await self.message_forwarder.forward_message(
                 client_id=client_id,
@@ -227,7 +235,19 @@ class ChirpStackMQTTSubscriber:
         {
           "applicationID": "1",
           "applicationName": "Test app",
-          "deviceName": "Test device",
+          "deviceInfo": {
+            "tenantId": "52f14cd4-c6f1-4fbd-8f87-4025e1d49242",
+            "tenantName": "ChirpStack",
+            "applicationId": "17c82e96-be03-4f38-aef3-f83d48582d97",
+            "applicationName": "Test application",
+            "deviceProfileId": "14855bf7-d10d-4aee-b618-ebfcb64dc7ad",
+            "deviceProfileName": "Test device-profile",
+            "deviceName": "Test device",
+            "devEui": "0101010101010101",
+            "tags": {
+              "key": "value"
+            }
+          },
           "devEUI": "0102030405060708",
           "rxInfo": [...],
           "txInfo": {...},
@@ -243,29 +263,34 @@ class ChirpStackMQTTSubscriber:
         }
         """
         
-        # First try to get decoded data from 'object' field
+        sensor_data = {}
         if "object" in chirpstack_payload and chirpstack_payload["object"]:
             logger.debug("Using decoded sensor data from 'object' field")
-            return chirpstack_payload["object"]
+            sensor_data.update(chirpstack_payload["object"])
+    
         
-        # Fallback: extract what we can from the payload
-        sensor_data = {}
-        
-        # Add metadata
-        if "devEUI" in chirpstack_payload:
-            sensor_data["dev_eui"] = chirpstack_payload["devEUI"]
-        
-        if "applicationID" in chirpstack_payload:
-            sensor_data["app_id"] = chirpstack_payload["applicationID"]
-        
-        if "fPort" in chirpstack_payload:
-            sensor_data["f_port"] = chirpstack_payload["fPort"]
-        
-        if "fCnt" in chirpstack_payload:
-            sensor_data["f_cnt"] = chirpstack_payload["fCnt"]
+        if "deviceInfo" in chirpstack_payload and chirpstack_payload["deviceInfo"]:
+            device_info = chirpstack_payload["deviceInfo"]
+            
+            if "deviceName" in device_info:
+                sensor_data["device_name"] = device_info["deviceName"]
+                logger.debug(f"Added device name: {device_info['deviceName']}")
+            
+            if "tags" in device_info and device_info["tags"]:
+                sensor_data["tags"] = device_info["tags"]
+                logger.debug(f"Added device tags: {device_info['tags']}")
+
+            if "applicationName" in device_info:
+                sensor_data["app_name"] = device_info["applicationName"]
+                
+            # if "tenantName" in device_info:
+            #     sensor_data["tenant_name"] = device_info["tenantName"]
+            
+            # if "deviceProfileName" in device_info:
+            #     sensor_data["device_profile_name"] = device_info["deviceProfileName"]
         
         # Add raw data if no decoded object
-        if "data" in chirpstack_payload:
+        if "data" in chirpstack_payload and not ("object" in chirpstack_payload and chirpstack_payload["object"]):
             sensor_data["raw_data"] = chirpstack_payload["data"]
             logger.warning("No decoded sensor data available, including raw base64 data")
         
