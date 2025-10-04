@@ -290,6 +290,10 @@ class ChirpStackMQTTSubscriber:
             #     sensor_data["device_profile_name"] = device_info["deviceProfileName"]
         
         # Add raw data if no decoded object
+        if "rxInfo" in chirpstack_payload:
+            sensor_data["rx_info"] = chirpstack_payload["rxInfo"]
+        if "txInfo" in chirpstack_payload:
+            sensor_data["tx_info"] = chirpstack_payload["txInfo"]
         if "data" in chirpstack_payload and not ("object" in chirpstack_payload and chirpstack_payload["object"]):
             sensor_data["raw_data"] = chirpstack_payload["data"]
             logger.warning("No decoded sensor data available, including raw base64 data")
