@@ -45,6 +45,12 @@ class LoRaAdapterConfig:
         # Application Configuration
         self.adapter_name: str = os.getenv("ADAPTER_NAME", "lora-adapter")
         self.health_check_interval: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))
+        
+        # GPS Kalman Filter Configuration
+        self.gps_filter_enabled: bool = os.getenv("GPS_FILTER_ENABLED", "true").lower() in ("true", "1", "yes")
+        self.gps_process_noise: float = float(os.getenv("GPS_PROCESS_NOISE", "1e-4"))
+        self.gps_measurement_noise: float = float(os.getenv("GPS_MEASUREMENT_NOISE", "1e-3"))
+        self.gps_initial_uncertainty: float = float(os.getenv("GPS_INITIAL_UNCERTAINTY", "1e-2"))
 
 
 # Global config instance

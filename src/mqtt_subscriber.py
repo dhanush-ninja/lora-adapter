@@ -8,11 +8,13 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from typing import Dict, Any, Optional
 import paho.mqtt.client as mqtt
 
 from route_map import RouteMapManager
 from config import config
+from gps_kalman_filter import DeviceGPSFilterManager
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,19 @@ class ChirpStackMQTTSubscriber:
         self.mqtt_thread = None
         self.queue: Optional[asyncio.Queue] = None
         self.workers = []
+        
+        # Initialize GPS Kalman filter manager
+        self.gps_filter_enabled = config.gps_filter_enabled
+        if self.gps_filter_enabled:
+            self.gps_filter_manager = DeviceGPSFilterManager(
+                process_noise=config.gps_process_noise,
+                measurement_noise=config.gps_measurement_noise,
+                initial_uncertainty=config.gps_initial_uncertainty
+            )
+            logger.info("GPS Kalman filter enabled for coordinate smoothing")
+        else:
+            self.gps_filter_manager = None
+            logger.info("GPS Kalman filter disabled")
         
         # Get MQTT config from environment
         self.mqtt_host = config.chirpstack_mqtt_host
@@ -48,6 +63,7 @@ class ChirpStackMQTTSubscriber:
         logger.info(f"MQTT config: {self.mqtt_host}:{self.mqtt_port}")
         if self.mqtt_username:
             logger.info("MQTT authentication enabled")
+        logger.info("GPS Kalman filter enabled for coordinate smoothing")
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback for when the client receives a CONNACK response from the server"""
@@ -267,6 +283,40 @@ class ChirpStackMQTTSubscriber:
         if "object" in chirpstack_payload and chirpstack_payload["object"]:
             logger.debug("Using decoded sensor data from 'object' field")
             sensor_data.update(chirpstack_payload["object"])
+            
+            if ("latitude" in sensor_data and "longitude" in sensor_data and 
+                self.gps_filter_enabled and self.gps_filter_manager):
+                try:
+                    raw_lat = float(sensor_data["latitude"])
+                    raw_lon = float(sensor_data["longitude"])
+                    
+                    device_id = chirpstack_payload.get("devEUI", "unknown")
+                    
+                    timestamp = sensor_data.get("timestamp", time.time())
+
+                    filtered_lat, filtered_lon = self.gps_filter_manager.filter_gps(
+                        device_id=device_id,
+                        latitude=raw_lat,
+                        longitude=raw_lon,
+                        timestamp=timestamp
+                    )
+                    
+                    sensor_data["latitude_raw"] = raw_lat
+                    sensor_data["longitude_raw"] = raw_lon
+                    sensor_data["latitude"] = filtered_lat
+                    sensor_data["longitude"] = filtered_lon
+                    
+                    # Calculate and log the filtering effect
+                    lat_diff = abs(filtered_lat - raw_lat)
+                    lon_diff = abs(filtered_lon - raw_lon)
+                    if lat_diff > 1e-6 or lon_diff > 1e-6:
+                        logger.info(f"GPS filtered for {device_id}: "
+                                  f"lat Δ{lat_diff:.6f}, lon Δ{lon_diff:.6f}")
+                    
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"GPS filtering failed: {e}, using raw coordinates")
+                except Exception as e:
+                    logger.error(f"GPS Kalman filter error: {e}, using raw coordinates")
     
         
         if "deviceInfo" in chirpstack_payload and chirpstack_payload["deviceInfo"]:
