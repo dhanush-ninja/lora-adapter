@@ -22,14 +22,17 @@ class MessageForwarder:
         self.user = user
         self.password = password
         self.nc: Optional[nats.NATS] = None
+        self.reconnect_delay = 1  # seconds
+        self.max_reconnect_delay = 30  # seconds
     
     async def connect(self):
-        """Connect to NATS"""
+        """Connect to NATS with reconnection support"""
         try:
             connect_opts = {
                 "connect_timeout": 10,
-                "max_reconnect_attempts": 3,
+                "max_reconnect_attempts": -1,  # Unlimited reconnection attempts
                 "reconnect_time_wait": 2,
+                "allow_reconnect": True,
             }
             
             if self.user and self.password:
@@ -38,6 +41,24 @@ class MessageForwarder:
                 logger.info("Connecting to NATS with authentication")
             else:
                 logger.info("Connecting to NATS without authentication")
+            
+            # Add connection event handlers
+            async def disconnected_cb():
+                logger.warning("Message forwarder NATS connection lost!")
+            
+            async def reconnected_cb():
+                logger.info("Message forwarder NATS connection restored!")
+            
+            async def error_cb(e):
+                logger.error(f"Message forwarder NATS connection error: {e}")
+            
+            async def closed_cb():
+                logger.warning("Message forwarder NATS connection closed")
+            
+            connect_opts["disconnected_cb"] = disconnected_cb
+            connect_opts["reconnected_cb"] = reconnected_cb
+            connect_opts["error_cb"] = error_cb
+            connect_opts["closed_cb"] = closed_cb
             
             self.nc = await nats.connect(self.nats_url, **connect_opts)
             logger.info(f"Connected to SuperMQ NATS at {self.nats_url}")
@@ -48,9 +69,34 @@ class MessageForwarder:
     
     async def disconnect(self):
         """Disconnect from NATS"""
-        if self.nc:
-            await self.nc.close()
-            logger.info("Disconnected from NATS")
+        if self.nc and not self.nc.is_closed:
+            try:
+                await self.nc.close()
+                logger.info("Disconnected from NATS")
+            except Exception as e:
+                logger.error(f"Error disconnecting from NATS: {e}")
+        
+        self.nc = None
+    
+    def is_connected(self) -> bool:
+        """Check if NATS connection is active"""
+        return self.nc is not None and not self.nc.is_closed
+    
+    async def ensure_connected(self):
+        """Ensure NATS connection is active, reconnect if needed"""
+        if not self.nc or self.nc.is_closed:
+            logger.info("NATS connection lost, attempting to reconnect...")
+            current_delay = self.reconnect_delay
+            
+            while True:
+                try:
+                    await self.connect()
+                    return
+                except Exception as e:
+                    logger.error(f"Reconnection failed: {e}")
+                    logger.info(f"Retrying in {current_delay} seconds...")
+                    await asyncio.sleep(current_delay)
+                    current_delay = min(current_delay * 2, self.max_reconnect_delay)
     
     async def forward_message(
         self,
@@ -62,6 +108,9 @@ class MessageForwarder:
     ):
         """Forward message to SuperMQ in protobuf format"""
         try:
+            # Ensure we have a valid connection
+            await self.ensure_connected()
+            
             # Convert payload to JSON bytes
             payload_json = json.dumps(payload)
             payload_bytes = payload_json.encode('utf-8')
@@ -90,7 +139,8 @@ class MessageForwarder:
             
         except Exception as e:
             logger.error(f"Failed to forward message to SuperMQ: {e}")
-            raise
+            # Don't re-raise the exception to prevent blocking the MQTT subscriber
+            # The message will be lost, but the adapter will continue running
     
     def encode_protobuf_message(
         self,

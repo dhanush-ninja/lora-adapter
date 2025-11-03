@@ -232,13 +232,17 @@ class ChirpStackMQTTSubscriber:
                 logger.info(f"Including metadata: {', '.join(metadata_fields)}")
             
             # Forward to SuperMQ via message forwarder
-            await self.message_forwarder.forward_message(
-                client_id=client_id,
-                channel_id=channel_id,
-                domain_id=domain_id,
-                payload=sensor_data,
-                protocol="lora"
-            )
+            try:
+                await self.message_forwarder.forward_message(
+                    client_id=client_id,
+                    channel_id=channel_id,
+                    domain_id=domain_id,
+                    payload=sensor_data,
+                    protocol="lora"
+                )
+            except Exception as e:
+                logger.error(f"Error forwarding message to SuperMQ: {e}")
+                # Don't propagate the error to keep MQTT processing running
             
         except Exception as e:
             logger.error(f"Error forwarding message to SuperMQ: {e}")

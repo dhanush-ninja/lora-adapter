@@ -30,13 +30,16 @@ class SuperMQEventSubscriber:
         self.js = None
         self.running = False
         self.consumer_name = "lora-adapter"
+        self.reconnect_delay = 5  # seconds
+        self.max_reconnect_delay = 60  # seconds
     
     async def connect(self):
         """Connect to NATS server with optional JetStream authentication"""
         connect_opts = {
             "connect_timeout": 10,
-            "max_reconnect_attempts": 3,
+            "max_reconnect_attempts": -1,  # Unlimited reconnection attempts
             "reconnect_time_wait": 2,
+            "allow_reconnect": True,
         }
         
         if self.user and self.password:
@@ -48,6 +51,31 @@ class SuperMQEventSubscriber:
         
         try:
             logger.info(f"Attempting to connect to NATS at {self.nats_url}")
+            
+            # Add connection event handlers
+            async def disconnected_cb():
+                logger.warning("NATS connection lost!")
+            
+            async def reconnected_cb():
+                logger.info("NATS connection restored!")
+                # Reinitialize JetStream after reconnection
+                try:
+                    self.js = self.nc.jetstream()
+                    await self.ensure_stream_exists()
+                except Exception as e:
+                    logger.error(f"Failed to reinitialize JetStream after reconnection: {e}")
+            
+            async def error_cb(e):
+                logger.error(f"NATS connection error: {e}")
+            
+            async def closed_cb():
+                logger.warning("NATS connection closed")
+            
+            connect_opts["disconnected_cb"] = disconnected_cb
+            connect_opts["reconnected_cb"] = reconnected_cb
+            connect_opts["error_cb"] = error_cb
+            connect_opts["closed_cb"] = closed_cb
+            
             self.nc = await asyncio.wait_for(
                 nats.connect(self.nats_url, **connect_opts),
                 timeout=15.0
@@ -83,7 +111,37 @@ class SuperMQEventSubscriber:
                 await self.js.add_stream(**stream_config)
                 logger.info("Events stream created successfully")
             except Exception as e:
-                logger.warning(f"Could not create stream (may already exist): {e}")
+                logger.error(f"Could not create stream (may already exist): {e}")
+    
+    async def reconnect(self):
+        """Reconnect to NATS with exponential backoff"""
+        current_delay = self.reconnect_delay
+        
+        while self.running:
+            try:
+                logger.info(f"Attempting to reconnect to NATS...")
+                
+                # Close existing connection if any
+                if self.nc and not self.nc.is_closed:
+                    try:
+                        await self.nc.close()
+                    except Exception:
+                        pass
+                
+                # Reconnect
+                await self.connect()
+                await self.ensure_stream_exists()
+                logger.info("Successfully reconnected to NATS")
+                return
+                
+            except Exception as e:
+                logger.error(f"Reconnection failed: {e}")
+                if self.running:
+                    logger.info(f"Retrying reconnection in {current_delay} seconds...")
+                    await asyncio.sleep(current_delay)
+                    current_delay = min(current_delay * 2, self.max_reconnect_delay)
+                else:
+                    break
     
     def decode_message(self, msg):
         """Decode message data with multiple encoding attempts"""
@@ -134,68 +192,100 @@ class SuperMQEventSubscriber:
         return None
     
     async def subscribe_to_client_events(self):
-        """Subscribe to client events"""
-        try:
-            psub = await self.js.pull_subscribe(
-                subject="events.supermq.client.*",
-                durable=f"{self.consumer_name}-clients"
-            )
-            
-            logger.info("Subscribed to client events: events.supermq.client.*")
-            
-            while self.running:
-                try:
-                    msgs = await psub.fetch(batch=getattr(config, 'js_batch_size', 32), timeout=getattr(config, 'js_fetch_timeout', 1.0))
-                    for msg in msgs:
-                        try:
-                            await self.handle_client_event(msg)
-                            await msg.ack()
-                        except Exception as e:
-                            logger.error(f"Client event processing failed, NAKing: {e}")
+        """Subscribe to client events with reconnection handling"""
+        current_delay = self.reconnect_delay
+        
+        while self.running:
+            try:
+                # Check if connection is still valid
+                if not self.nc or self.nc.is_closed:
+                    logger.info("NATS connection lost, attempting to reconnect...")
+                    await self.reconnect()
+                
+                psub = await self.js.pull_subscribe(
+                    subject="events.supermq.client.*",
+                    durable=f"{self.consumer_name}-clients"
+                )
+                
+                logger.info("Subscribed to client events: events.supermq.client.*")
+                current_delay = self.reconnect_delay  # Reset delay on successful connection
+                
+                while self.running:
+                    try:
+                        msgs = await psub.fetch(
+                            batch=getattr(config, 'js_batch_size', 32), 
+                            timeout=getattr(config, 'js_fetch_timeout', 1.0)
+                        )
+                        for msg in msgs:
                             try:
-                                await msg.nak()
-                            except Exception:
-                                pass
-                except TimeoutError:
-                    continue  # Normal timeout, keep running
-                except Exception as e:
-                    logger.error(f"Error in client event subscription: {e}")
-                    await asyncio.sleep(1)
-                    
-        except Exception as e:
-            logger.error(f"Failed to subscribe to client events: {e}")
+                                await self.handle_client_event(msg)
+                                await msg.ack()
+                            except Exception as e:
+                                logger.error(f"Client event processing failed, NAKing: {e}")
+                                try:
+                                    await msg.nak()
+                                except Exception:
+                                    pass
+                    except TimeoutError:
+                        continue  # Normal timeout, keep running
+                    except Exception as e:
+                        logger.error(f"Error in client event subscription: {e}")
+                        break  # Break inner loop to reconnect
+                        
+            except Exception as e:
+                logger.error(f"Failed to subscribe to client events: {e}")
+                if self.running:
+                    logger.info(f"Retrying client event subscription in {current_delay} seconds...")
+                    await asyncio.sleep(current_delay)
+                    current_delay = min(current_delay * 2, self.max_reconnect_delay)
     
     async def subscribe_to_channel_events(self):
-        """Subscribe to channel events"""
-        try:
-            psub = await self.js.pull_subscribe(
-                subject="events.supermq.channel.*",
-                durable=f"{self.consumer_name}-channels"
-            )
-            
-            logger.info("Subscribed to channel events: events.supermq.channel.*")
-            
-            while self.running:
-                try:
-                    msgs = await psub.fetch(batch=getattr(config, 'js_batch_size', 32), timeout=getattr(config, 'js_fetch_timeout', 1.0))
-                    for msg in msgs:
-                        try:
-                            await self.handle_channel_event(msg)
-                            await msg.ack()
-                        except Exception as e:
-                            logger.error(f"Channel event processing failed, NAKing: {e}")
+        """Subscribe to channel events with reconnection handling"""
+        current_delay = self.reconnect_delay
+        
+        while self.running:
+            try:
+                # Check if connection is still valid
+                if not self.nc or self.nc.is_closed:
+                    logger.info("NATS connection lost, attempting to reconnect...")
+                    await self.reconnect()
+                
+                psub = await self.js.pull_subscribe(
+                    subject="events.supermq.channel.*",
+                    durable=f"{self.consumer_name}-channels"
+                )
+                
+                logger.info("Subscribed to channel events: events.supermq.channel.*")
+                current_delay = self.reconnect_delay  # Reset delay on successful connection
+                
+                while self.running:
+                    try:
+                        msgs = await psub.fetch(
+                            batch=getattr(config, 'js_batch_size', 32), 
+                            timeout=getattr(config, 'js_fetch_timeout', 1.0)
+                        )
+                        for msg in msgs:
                             try:
-                                await msg.nak()
-                            except Exception:
-                                pass
-                except TimeoutError:
-                    continue  # Normal timeout, keep running
-                except Exception as e:
-                    logger.error(f"Error in channel event subscription: {e}")
-                    await asyncio.sleep(1)
-                    
-        except Exception as e:
-            logger.error(f"Failed to subscribe to channel events: {e}")
+                                await self.handle_channel_event(msg)
+                                await msg.ack()
+                            except Exception as e:
+                                logger.error(f"Channel event processing failed, NAKing: {e}")
+                                try:
+                                    await msg.nak()
+                                except Exception:
+                                    pass
+                    except TimeoutError:
+                        continue  # Normal timeout, keep running
+                    except Exception as e:
+                        logger.error(f"Error in channel event subscription: {e}")
+                        break  # Break inner loop to reconnect
+                        
+            except Exception as e:
+                logger.error(f"Failed to subscribe to channel events: {e}")
+                if self.running:
+                    logger.info(f"Retrying channel event subscription in {current_delay} seconds...")
+                    await asyncio.sleep(current_delay)
+                    current_delay = min(current_delay * 2, self.max_reconnect_delay)
     
     async def handle_client_event(self, msg):
         """Handle client events and update route maps"""
@@ -350,11 +440,24 @@ class SuperMQEventSubscriber:
             logger.error(f"Error processing channel disconnect: {e}")
     
     async def start(self):
-        """Start the event subscriber"""
+        """Start the event subscriber with robust error handling"""
         self.running = True
         
-        await self.connect()
-        await self.ensure_stream_exists()
+        # Initial connection with retry logic
+        current_delay = self.reconnect_delay
+        while self.running:
+            try:
+                await self.connect()
+                await self.ensure_stream_exists()
+                break  # Successfully connected
+            except Exception as e:
+                logger.error(f"Initial connection failed: {e}")
+                if self.running:
+                    logger.info(f"Retrying initial connection in {current_delay} seconds...")
+                    await asyncio.sleep(current_delay)
+                    current_delay = min(current_delay * 2, self.max_reconnect_delay)
+                else:
+                    return
         
         # Start both subscriptions concurrently
         tasks = [
@@ -365,7 +468,7 @@ class SuperMQEventSubscriber:
         logger.info("SuperMQ event subscriber started")
         
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
             logger.error(f"Event subscriber error: {e}")
         finally:
@@ -373,8 +476,15 @@ class SuperMQEventSubscriber:
     
     async def stop(self):
         """Stop the event subscriber"""
+        logger.info("Stopping SuperMQ event subscriber...")
         self.running = False
         
-        if self.nc:
-            await self.nc.close()
-            logger.info("NATS connection closed")
+        if self.nc and not self.nc.is_closed:
+            try:
+                await self.nc.close()
+                logger.info("NATS connection closed")
+            except Exception as e:
+                logger.error(f"Error closing NATS connection: {e}")
+        
+        self.nc = None
+        self.js = None
